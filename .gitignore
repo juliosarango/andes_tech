@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+andestech.db
+*.db-journal
+.DS_Store
