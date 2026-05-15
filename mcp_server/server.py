@@ -20,7 +20,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="\033[36m%(asctime)s\033[0m \033[1;33m[AndesTech MCP]\033[0m %(message)s",
     datefmt="%H:%M:%S",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[logging.StreamHandler(sys.stderr)],
     force=True,
 )
 logger = logging.getLogger("andestech.mcp")
@@ -30,7 +30,6 @@ mcp = FastMCP(
     "AndesTech Negocio",
     host=MCP_HOST,
     port=MCP_PORT,
-    sse_path="/sse",
 )
 
 
@@ -62,6 +61,40 @@ def _get(path: str, params: dict | None = None) -> dict | list:
     url = f"{API_BASE}{path}"
     try:
         resp = httpx.get(url, params=params or {}, timeout=10.0)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.ConnectError:
+        raise RuntimeError(
+            f"No se puede conectar a la API de negocio en {API_BASE}. "
+            "Verifica que esté corriendo con: bash scripts/start_api.sh"
+        )
+    except httpx.HTTPStatusError as e:
+        raise RuntimeError(
+            f"Error de la API ({e.response.status_code}): {e.response.text}"
+        )
+
+
+def _post(path: str, data: dict) -> dict:
+    url = f"{API_BASE}{path}"
+    try:
+        resp = httpx.post(url, json=data, timeout=10.0)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.ConnectError:
+        raise RuntimeError(
+            f"No se puede conectar a la API de negocio en {API_BASE}. "
+            "Verifica que esté corriendo con: bash scripts/start_api.sh"
+        )
+    except httpx.HTTPStatusError as e:
+        raise RuntimeError(
+            f"Error de la API ({e.response.status_code}): {e.response.text}"
+        )
+
+
+def _patch(path: str, data: dict) -> dict:
+    url = f"{API_BASE}{path}"
+    try:
+        resp = httpx.patch(url, json=data, timeout=10.0)
         resp.raise_for_status()
         return resp.json()
     except httpx.ConnectError:
@@ -423,14 +456,98 @@ def historial_cliente(cliente_id: int) -> str:
     return "\n".join(lineas)
 
 
+@mcp.tool()
+def crear_lead(
+    nombre_contacto: str,
+    empresa: str,
+    email: str | None = None,
+    telefono: str | None = None,
+    interes: str | None = None,
+    valor_estimado: float | None = None,
+    estado: str = "nuevo",
+    fecha_seguimiento: str | None = None,
+    notas: str | None = None,
+) -> str:
+    """
+    Registra un nuevo lead (prospecto) en el CRM de AndesTech.
+    Úsala cuando el usuario quiera agregar un cliente potencial, anotar un
+    contacto que mostró interés, o registrar un prospecto nuevo.
+    El estado por defecto es 'nuevo'. Estados válidos: nuevo, contactado,
+    en_negociacion, cerrado_ganado, cerrado_perdido.
+    fecha_seguimiento en formato YYYY-MM-DD. valor_estimado en USD.
+    """
+    _log_tool("crear_lead", nombre_contacto=nombre_contacto, empresa=empresa)
+
+    lead = _post("/api/leads", {
+        "nombre_contacto": nombre_contacto,
+        "empresa": empresa,
+        "email": email,
+        "telefono": telefono,
+        "interes": interes,
+        "valor_estimado": valor_estimado,
+        "estado": estado,
+        "fecha_seguimiento": fecha_seguimiento,
+        "notas": notas,
+    })
+
+    return (
+        f"✅ Lead creado exitosamente (ID: {lead['id']})\n\n"
+        f"Contacto:   {lead['nombre_contacto']}\n"
+        f"Empresa:    {lead['empresa']}\n"
+        f"Estado:     {lead['estado']}\n"
+        f"Interés:    {lead.get('interes') or 'No especificado'}\n"
+        f"Valor est.: {_moneda(lead['valor_estimado']) if lead.get('valor_estimado') else 'No especificado'}\n"
+        f"Seguim.:    {lead.get('fecha_seguimiento') or 'No agendado'}\n"
+        f"Creado:     {lead['fecha_creacion']}"
+    )
+
+
+@mcp.tool()
+def ingresar_stock(producto_id: int, cantidad: int) -> str:
+    """
+    Registra el ingreso de nuevas unidades al inventario de un producto.
+    Úsala cuando el usuario indique que llegó mercadería, que se reabastecieron
+    productos, o que quiere actualizar el stock de un artículo específico.
+    Requiere el ID del producto (obtenible con consultar_inventario o
+    buscar_producto) y la cantidad de unidades a agregar al stock actual.
+    """
+    _log_tool("ingresar_stock", producto_id=producto_id, cantidad=cantidad)
+
+    p = _patch(f"/api/inventario/{producto_id}/stock", {"cantidad": cantidad})
+
+    alerta = (
+        ""
+        if p["stock_ok"]
+        else f"\n⚠  Aún bajo el mínimo — faltan {p['stock_minimo'] - p['stock']} uds más"
+    )
+
+    return (
+        f"✅ Stock actualizado — {p['nombre']}\n\n"
+        f"Stock anterior:    {p['stock_anterior']} unidades\n"
+        f"Unidades ingres.:  +{p['unidades_ingresadas']}\n"
+        f"Stock actual:      {p['stock']} unidades\n"
+        f"Stock mínimo:      {p['stock_minimo']} unidades\n"
+        f"Estado:            {'✓ OK' if p['stock_ok'] else '⚠ Bajo mínimo'}{alerta}\n"
+        f"Actualizado:       {p['ultima_actualizacion']}"
+    )
+
+
 if __name__ == "__main__":
-    logger.info("=" * 55)
-    logger.info("  AndesTech MCP Server — Demo AWS GenAI Day Ecuador 2026")
-    logger.info("=" * 55)
-    logger.info("API de negocio : %s", API_BASE)
-    logger.info("SSE endpoint   : http://%s:%s/sse", MCP_HOST, MCP_PORT)
-    logger.info("Healthcheck    : http://%s:%s/health", MCP_HOST, MCP_PORT)
-    logger.info("Herramientas   : 10 disponibles para Claude")
-    logger.info("-" * 55)
-    logger.info("Esperando conexión de Claude Desktop...")
-    mcp.run(transport="sse")
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stdio", action="store_true", help="Modo stdio para Claude Desktop local")
+    args = parser.parse_args()
+
+    if args.stdio:
+        mcp.run(transport="stdio")
+    else:
+        logger.info("=" * 55)
+        logger.info("  AndesTech MCP Server — Demo AWS GenAI Day Ecuador 2026")
+        logger.info("=" * 55)
+        logger.info("API de negocio : %s", API_BASE)
+        logger.info("MCP endpoint   : http://%s:%s/mcp", MCP_HOST, MCP_PORT)
+        logger.info("Healthcheck    : http://%s:%s/health", MCP_HOST, MCP_PORT)
+        logger.info("Herramientas   : 12 disponibles para Claude")
+        logger.info("-" * 55)
+        logger.info("Esperando conexión de Claude Desktop...")
+        mcp.run(transport="streamable-http")

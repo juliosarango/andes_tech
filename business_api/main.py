@@ -1,8 +1,27 @@
+from datetime import date
+
 from fastapi import FastAPI, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import func, case
 from .database import get_db
 from .models import Producto, Cliente, Venta, Lead
+
+
+class LeadCreate(BaseModel):
+    nombre_contacto: str
+    empresa: str
+    email: str | None = None
+    telefono: str | None = None
+    interes: str | None = None
+    valor_estimado: float | None = None
+    estado: str = "nuevo"
+    fecha_seguimiento: str | None = None
+    notas: str | None = None
+
+
+class StockIngreso(BaseModel):
+    cantidad: int
 
 app = FastAPI(
     title="AndesTech Business API",
@@ -96,6 +115,25 @@ def detalle_producto(producto_id: int, db: Session = Depends(get_db)):
     if not p:
         raise HTTPException(status_code=404, detail=f"Producto con ID {producto_id} no encontrado")
     return _producto_dict(p)
+
+
+@app.patch("/api/inventario/{producto_id}/stock")
+def ingresar_stock(producto_id: int, body: StockIngreso, db: Session = Depends(get_db)):
+    if body.cantidad <= 0:
+        raise HTTPException(status_code=400, detail="La cantidad debe ser mayor a cero")
+    p = db.get(Producto, producto_id)
+    if not p:
+        raise HTTPException(status_code=404, detail=f"Producto con ID {producto_id} no encontrado")
+    stock_anterior = p.stock
+    p.stock += body.cantidad
+    p.ultima_actualizacion = date.today().isoformat()
+    db.commit()
+    db.refresh(p)
+    return {
+        **_producto_dict(p),
+        "stock_anterior": stock_anterior,
+        "unidades_ingresadas": body.cantidad,
+    }
 
 
 # Clientes — /buscar antes de /{cliente_id}
@@ -203,6 +241,26 @@ def detalle_lead(lead_id: int, db: Session = Depends(get_db)):
     if not l:
         raise HTTPException(status_code=404, detail=f"Lead con ID {lead_id} no encontrado")
     return _lead_completo(l)
+
+
+@app.post("/api/leads", status_code=201)
+def crear_lead(body: LeadCreate, db: Session = Depends(get_db)):
+    nuevo = Lead(
+        nombre_contacto=body.nombre_contacto,
+        empresa=body.empresa,
+        email=body.email,
+        telefono=body.telefono,
+        interes=body.interes,
+        valor_estimado=body.valor_estimado,
+        estado=body.estado,
+        fecha_creacion=date.today().isoformat(),
+        fecha_seguimiento=body.fecha_seguimiento,
+        notas=body.notas,
+    )
+    db.add(nuevo)
+    db.commit()
+    db.refresh(nuevo)
+    return _lead_completo(nuevo)
 
 
 @app.get("/api/ventas/recientes")
