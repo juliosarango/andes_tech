@@ -15,15 +15,19 @@ API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
 MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.getenv("MCP_PORT", "8080"))
 
-# Colores para que cada invocación de Claude sea visible en pantalla durante la demo
-logging.basicConfig(
-    level=logging.INFO,
-    format="\033[36m%(asctime)s\033[0m \033[1;33m[AndesTech MCP]\033[0m %(message)s",
-    datefmt="%H:%M:%S",
-    handlers=[logging.StreamHandler(sys.stderr)],
-    force=True,
-)
+# Logger propio con handler directo en stderr — sobrevive al reset de logging que
+# hace uvicorn internamente al arrancar (dictConfig sobrescribe el root logger,
+# pero no afecta loggers con propagate=False y handler propio).
 logger = logging.getLogger("andestech.mcp")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+if not logger.handlers:
+    _h = logging.StreamHandler(sys.stderr)
+    _h.setFormatter(logging.Formatter(
+        "\033[36m%(asctime)s\033[0m \033[1;33m[AndesTech MCP]\033[0m %(message)s",
+        datefmt="%H:%M:%S",
+    ))
+    logger.addHandler(_h)
 
 
 mcp = FastMCP(

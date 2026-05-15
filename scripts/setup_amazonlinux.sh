@@ -1,17 +1,20 @@
 #!/bin/bash
 # =============================================================================
-# setup_amazonlinux.sh — Setup de AndesTech en Amazon EC2 Amazon Linux 2023
+# setup_amazonlinux.sh — Setup completo de AndesTech en Amazon Linux 2023
 #
-# Diferencias vs setup_ec2.sh (Ubuntu):
-#   - Gestor de paquetes: dnf en lugar de apt-get
-#   - Usuario por defecto: ec2-user en lugar de ubuntu
-#   - Sin ufw: el firewall lo manejan los Security Groups de AWS
-#   - Python 3.12 disponible directamente con dnf en AL2023
+# Levanta 3 servicios systemd:
+#   - andestech-api     : FastAPI en puerto 8000
+#   - andestech-mcp     : MCP Server en puerto 8080
+#   - andestech-tunnel  : Cloudflare Tunnel HTTPS → localhost:8080
 #
 # Uso:
 #   git clone https://github.com/juliosarango/andes_tech.git
 #   cd andes_tech
 #   bash scripts/setup_amazonlinux.sh
+#
+# Ejecutar como usuario ec2-user (no como root).
+# Solo necesitas el puerto 22 abierto en el Security Group (SSH).
+# Cloudflare Tunnel maneja el acceso HTTPS sin abrir puertos adicionales.
 # =============================================================================
 
 set -e
@@ -41,26 +44,46 @@ echo ""
 cd "$REPO_DIR"
 
 [ -f "requirements.txt" ] || err "Ejecuta este script desde la raíz del repositorio."
+[ "$USUARIO" != "root" ]  || err "No ejecutes como root. Usa ec2-user."
 
 # Verificar que estamos en Amazon Linux
 if ! grep -qi "amazon linux" /etc/os-release 2>/dev/null; then
     echo -e "${AMARILLO}ADVERTENCIA: Este script está optimizado para Amazon Linux 2023.${NC}"
-    echo "Para Ubuntu usa: bash scripts/setup_ec2.sh"
     read -rp "¿Continuar de todas formas? [s/N] " resp
     [[ "$resp" =~ ^[sS]$ ]] || exit 0
 fi
 
+# -----------------------------------------------------------------------------
 # 1. Actualizar sistema
+# -----------------------------------------------------------------------------
 info "Actualizando paquetes del sistema..."
 sudo dnf update -y -q
 ok "Sistema actualizado"
 
-# 2. Instalar Python 3.12 y herramientas
+# -----------------------------------------------------------------------------
+# 2. Instalar dependencias del sistema
+# -----------------------------------------------------------------------------
 info "Instalando Python 3.12, git y curl..."
-sudo dnf install -y -q python3.12 python3.12-pip git curl
+sudo dnf install -y -q python3.12 git curl
 ok "Python $(python3.12 --version) instalado"
 
-# 3. Crear entorno virtual
+# -----------------------------------------------------------------------------
+# 3. Instalar cloudflared
+# -----------------------------------------------------------------------------
+info "Instalando cloudflared..."
+if command -v cloudflared &>/dev/null; then
+    info "cloudflared ya instalado ($(cloudflared --version 2>&1 | head -1))"
+else
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+        -o /tmp/cloudflared
+    sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
+    rm /tmp/cloudflared
+    ok "cloudflared instalado ($(cloudflared --version 2>&1 | head -1))"
+fi
+
+# -----------------------------------------------------------------------------
+# 4. Entorno virtual Python
+# -----------------------------------------------------------------------------
 info "Creando entorno virtual Python..."
 if [ -d "venv" ]; then
     info "venv ya existe, omitiendo."
@@ -75,7 +98,9 @@ pip install --upgrade pip -q
 pip install -r requirements.txt -q
 ok "Dependencias Python instaladas"
 
-# 4. Crear archivo .env
+# -----------------------------------------------------------------------------
+# 5. Variables de entorno
+# -----------------------------------------------------------------------------
 info "Configurando variables de entorno..."
 if [ ! -f ".env" ]; then
     cp .env.example .env
@@ -84,16 +109,20 @@ else
     info ".env ya existe, omitiendo."
 fi
 
-# 5. Crear y poblar base de datos
+# -----------------------------------------------------------------------------
+# 6. Base de datos
+# -----------------------------------------------------------------------------
 info "Inicializando base de datos..."
 if [ -f "andestech.db" ]; then
-    info "BD ya existe. Usa 'python setup_db.py --reset' para recrear."
+    info "BD ya existe. Para recrear: source venv/bin/activate && python setup_db.py --reset"
 else
     python setup_db.py
     ok "Base de datos creada y poblada"
 fi
 
-# 6. Crear servicios systemd
+# -----------------------------------------------------------------------------
+# 7. Servicios systemd
+# -----------------------------------------------------------------------------
 info "Configurando servicios systemd..."
 
 sudo tee /etc/systemd/system/andestech-api.service > /dev/null << EOF
@@ -120,7 +149,7 @@ EOF
 
 sudo tee /etc/systemd/system/andestech-mcp.service > /dev/null << EOF
 [Unit]
-Description=AndesTech MCP Server (SSE)
+Description=AndesTech MCP Server
 After=network.target andestech-api.service
 Requires=andestech-api.service
 StartLimitIntervalSec=0
@@ -141,75 +170,115 @@ SyslogIdentifier=andestech-mcp
 WantedBy=multi-user.target
 EOF
 
+sudo tee /etc/systemd/system/andestech-tunnel.service > /dev/null << EOF
+[Unit]
+Description=Cloudflare Tunnel — AndesTech MCP HTTPS
+After=network.target andestech-mcp.service
+Requires=andestech-mcp.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=$USUARIO
+ExecStart=/usr/local/bin/cloudflared tunnel --url http://localhost:8080 --no-autoupdate
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=andestech-tunnel
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 sudo systemctl daemon-reload
-sudo systemctl enable andestech-api andestech-mcp
-ok "Servicios systemd configurados"
+sudo systemctl enable andestech-api andestech-mcp andestech-tunnel
+ok "3 servicios systemd configurados y habilitados"
 
-# 7. Nota sobre firewall
-echo ""
-echo -e "${AMARILLO}FIREWALL: En Amazon Linux el firewall se configura en el${NC}"
-echo -e "${AMARILLO}Security Group de la instancia EC2, no en el SO.${NC}"
-echo ""
-echo "  Asegúrate de tener estas reglas de entrada en tu Security Group:"
-echo "  ┌──────────┬──────────┬───────────────────────────────┐"
-echo "  │ Puerto   │ Protocolo│ Descripción                   │"
-echo "  ├──────────┼──────────┼───────────────────────────────┤"
-echo "  │ 22       │ TCP      │ SSH (tu IP o 0.0.0.0/0)       │"
-echo "  │ 8000     │ TCP      │ AndesTech API                 │"
-echo "  │ 8080     │ TCP      │ AndesTech MCP Server SSE      │"
-echo "  └──────────┴──────────┴───────────────────────────────┘"
-echo ""
-
+# -----------------------------------------------------------------------------
 # 8. Iniciar servicios
+# -----------------------------------------------------------------------------
 info "Iniciando servicios..."
 sudo systemctl start andestech-api
 sleep 3
 sudo systemctl start andestech-mcp
 sleep 2
+sudo systemctl start andestech-tunnel
+sleep 5
 ok "Servicios iniciados"
 
-# 9. Verificar healthchecks
-info "Verificando healthchecks..."
+# -----------------------------------------------------------------------------
+# 9. Healthchecks
+# -----------------------------------------------------------------------------
+info "Verificando servicios..."
 
-API_STATUS=$(curl -sf http://localhost:8000/api/health 2>/dev/null \
-    | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','error'))" 2>/dev/null || echo "error")
-MCP_STATUS=$(curl -sf http://localhost:8080/health 2>/dev/null \
-    | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','error'))" 2>/dev/null || echo "error")
+API_OK=$(curl -sf http://localhost:8000/api/health 2>/dev/null \
+    | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "error")
+MCP_OK=$(curl -sf http://localhost:8080/health 2>/dev/null \
+    | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "error")
+
+# Extraer URL del tunnel desde los logs de systemd
+TUNNEL_URL=$(sudo journalctl -u andestech-tunnel --no-pager -n 50 2>/dev/null \
+    | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | tail -1 || echo "")
 
 echo ""
 echo "========================================================="
 echo "  Estado de los servicios:"
-[ "$API_STATUS" = "ok" ] \
-    && echo -e "  API de negocio : ${VERDE}OK${NC}  → http://localhost:8000" \
-    || echo -e "  API de negocio : ${ROJO}ERROR${NC} — revisa: sudo journalctl -u andestech-api -n 30"
-[ "$MCP_STATUS" = "ok" ] \
-    && echo -e "  MCP Server SSE : ${VERDE}OK${NC}  → http://localhost:8080/sse" \
-    || echo -e "  MCP Server SSE : ${ROJO}ERROR${NC} — revisa: sudo journalctl -u andestech-mcp -n 30"
+if [ "$API_OK" = "ok" ]; then
+    echo -e "  API de negocio    : ${VERDE}OK${NC}  → http://localhost:8000"
+else
+    echo -e "  API de negocio    : ${ROJO}ERROR${NC}"
+    echo    "    → sudo journalctl -u andestech-api -n 30 --no-pager"
+fi
+if [ "$MCP_OK" = "ok" ]; then
+    echo -e "  MCP Server        : ${VERDE}OK${NC}  → http://localhost:8080/mcp"
+else
+    echo -e "  MCP Server        : ${ROJO}ERROR${NC}"
+    echo    "    → sudo journalctl -u andestech-mcp -n 30 --no-pager"
+fi
+if [ -n "$TUNNEL_URL" ]; then
+    echo -e "  Cloudflare Tunnel : ${VERDE}OK${NC}  → $TUNNEL_URL"
+else
+    echo -e "  Cloudflare Tunnel : ${AMARILLO}iniciando...${NC}"
+    echo    "    → sudo journalctl -u andestech-tunnel -f"
+fi
 echo "========================================================="
 
+# -----------------------------------------------------------------------------
 # 10. Instrucciones finales
-EC2_IP=$(curl -sf http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null \
-    || TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
-         -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null) \
-    && curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" \
-         http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null \
-    || echo "<EC2_PUBLIC_IP>")
-
+# -----------------------------------------------------------------------------
 echo ""
-echo "  Config para Claude Desktop:"
-echo "  {"
-echo '    "mcpServers": {'
-echo '      "andestech-negocio": {'
-echo "        \"url\": \"http://$EC2_IP:8080/sse\""
-echo '      }'
-echo '    }'
-echo "  }"
+if [ -n "$TUNNEL_URL" ]; then
+    echo -e "  ${VERDE}Config para Claude Desktop (copia esto):${NC}"
+    echo ""
+    echo '  {'
+    echo '    "mcpServers": {'
+    echo '      "andestech-negocio": {'
+    echo "        \"url\": \"$TUNNEL_URL/mcp\""
+    echo '      }'
+    echo '    }'
+    echo '  }'
+else
+    echo -e "  ${AMARILLO}El tunnel aún no tiene URL. Espera unos segundos y ejecuta:${NC}"
+    echo ""
+    echo "    sudo journalctl -u andestech-tunnel -f | grep trycloudflare"
+    echo ""
+    echo "  Luego usa la URL en Claude Desktop:"
+    echo '  { "mcpServers": { "andestech-negocio": { "url": "https://<url>.trycloudflare.com/mcp" } } }'
+fi
+echo ""
+echo "  Rutas del config en Claude Desktop:"
+echo "    Windows (Store) : %LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude_desktop_config.json"
+echo "    Windows (exe)   : %APPDATA%\Claude\claude_desktop_config.json"
+echo "    macOS           : ~/Library/Application Support/Claude/claude_desktop_config.json"
 echo ""
 echo "  Comandos útiles:"
-echo "    Logs API  : sudo journalctl -u andestech-api -f"
-echo "    Logs MCP  : sudo journalctl -u andestech-mcp -f"
-echo "    Reiniciar : sudo systemctl restart andestech-api andestech-mcp"
+echo "    URL del tunnel   : sudo journalctl -u andestech-tunnel --no-pager | grep trycloudflare | tail -1"
+echo "    Logs MCP en vivo : sudo journalctl -u andestech-mcp -f -o cat"
+echo "    Logs API en vivo : sudo journalctl -u andestech-api -f"
+echo "    Reiniciar todo   : sudo systemctl restart andestech-api andestech-mcp andestech-tunnel"
+echo "    Reset base datos : source venv/bin/activate && python setup_db.py --reset"
 echo ""
 echo "========================================================="
-echo "  ¡Setup completo en Amazon Linux 2023!"
+echo "  ¡Setup completo! Listo para la demo."
 echo "========================================================="
