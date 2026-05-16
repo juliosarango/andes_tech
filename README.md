@@ -172,18 +172,7 @@ sudo journalctl -u andestech-mcp -f
 
 ### Configurar Claude Desktop para EC2
 
-```json
-{
-  "mcpServers": {
-    "andestech-negocio": {
-      "url": "http://<EC2_PUBLIC_IP>:8080/sse"
-    }
-  }
-}
-```
-
-Reemplaza `<EC2_PUBLIC_IP>` con la IP pública de tu instancia.
-
+En claude desktop, Settings->Conectors->Customize agregar conector con la dirección https que nos dio cloudfare.
 ---
 
 ## Estructura del proyecto
